@@ -6,6 +6,8 @@
 
 #include <Arduino.h>
 #include "esp_log.h"
+#include <Wire.h>
+#include "RTClib.h"
 
 // ESP-IDF includes для USB Host
 extern "C" {
@@ -17,6 +19,10 @@ extern "C" {
 }
 
 static const char* TAG = "USB_HOST";
+
+// RTC об'єкт для тестування
+RTC_DS1307 rtc;
+bool rtc_working = false;
 
 bool host_lib_init = false;
 bool device_connected = false;
@@ -36,6 +42,20 @@ String lineBuffer = "";
 // Глобальна змінна для endpoint
 uint8_t cdc_in_endpoint = 0;
 
+// Функція для отримання часу з RTC
+String getTimeString() {
+    if (!rtc_working) {
+        return "[NO_RTC]";
+    }
+    
+    DateTime now = rtc.now();
+    char buffer[25];
+    sprintf(buffer, "[%02d.%02d.%04d %02d:%02d:%02d]", 
+            now.day(), now.month(), now.year(),
+            now.hour(), now.minute(), now.second());
+    return String(buffer);
+}
+
 // Transfer callback для читання даних - З БУФЕРИЗАЦІЄЮ
 void usb_transfer_cb(usb_transfer_t *transfer) {
     // Перевіряємо чи це не transfer від активної задачі
@@ -46,8 +66,9 @@ void usb_transfer_cb(usb_transfer_t *transfer) {
                 char ch = (char)transfer->data_buffer[i];
                 
                 if (ch == '\n') {
-                    // Знайдено кінець рядка - виводимо повний рядок
-                    Serial.println(lineBuffer);
+                    // Знайдено кінець рядка - виводимо повний рядок з часом
+                    String timeStr = getTimeString();
+                    Serial.println(timeStr + " " + lineBuffer);
                     lineBuffer = ""; // Очищуємо буфер
                 } else if (ch == '\r') {
                     // Ігноруємо \r
@@ -110,8 +131,9 @@ void cdc_reader_task(void *arg) {
                             char ch = (char)read_transfer->data_buffer[i];
                             
                             if (ch == '\n') {
-                                // Знайдено кінець рядка - виводимо повний рядок
-                                Serial.println(lineBuffer);
+                                // Знайдено кінець рядка - виводимо повний рядок з часом
+                                String timeStr = getTimeString();
+                                Serial.println(timeStr + " " + lineBuffer);
                                 lineBuffer = ""; // Очищуємо буфер
                             } else if (ch == '\r') {
                                 // Ігноруємо \r
@@ -341,6 +363,24 @@ void setup() {
     Serial.println("===============================================");
     Serial.println("    ESP32-S3 USB Host Logger - TRUE HOST");
     Serial.println("===============================================");
+    
+    // Тест RTC - простий
+    Serial.println("Тестуємо RTC...");
+    Wire.begin(8, 9); // SDA=GPIO8, SCL=GPIO9
+    delay(100);
+    
+    if (rtc.begin()) {
+        Serial.println("RTC знайдено!");
+        rtc_working = true;
+        DateTime now = rtc.now();
+        Serial.printf("Час з RTC: %04d-%02d-%02d %02d:%02d:%02d\n",
+                      now.year(), now.month(), now.day(),
+                      now.hour(), now.minute(), now.second());
+    } else {
+        Serial.println("RTC НЕ знайдено!");
+        rtc_working = false;
+    }
+    
     Serial.println("Ініціалізація USB Host...");
     
     // Налаштовуємо GPIO для USB-OTG (Host mode)
