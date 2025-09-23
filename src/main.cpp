@@ -1,13 +1,28 @@
 /*
  * ESP32-S3 USB Host Logger - Правильна реалізація USB Host
  * 
- * Використовує ESP-IDF USB Host API для читання CDC пристроїв через USB Type-C
+ * Використовує                if (ch == '\n') {
+                    // Знайдено кіне                            if (ch == '\n') {
+                                // Знайдено кінець рядка - виводимо повний рядок
+                                String timeStr = getTimeString();
+                                String fullMessage = timeStr + " " + lineBuffer;
+                                Serial.println(fullMessage);
+                                writeToSD(fullMessage); // Записуємо на SD
+                                lineBuffer = ""; // Очищуємо буфердка - виводимо повний рядок
+                    String timeStr = getTimeString();
+                    String fullMessage = timeStr + " " + lineBuffer;
+                    Serial.println(fullMessage);
+                    writeToSD(fullMessage); // Записуємо на SD
+                    lineBuffer = ""; // Очищуємо буферIDF USB Host API для читання CDC пристроїв через USB Type-C
  */
 
 #include <Arduino.h>
 #include "esp_log.h"
 #include <Wire.h>
 #include "RTClib.h"
+#include "FS.h"
+#include "SD.h"
+#include "SPI.h"
 
 // ESP-IDF includes для USB Host
 extern "C" {
@@ -23,6 +38,10 @@ static const char* TAG = "USB_HOST";
 // RTC об'єкт для тестування
 RTC_DS1307 rtc;
 bool rtc_working = false;
+
+// SD карта піни і стан
+#define SD_CS_PIN 4     // Новий CS пін
+bool sd_available = false;
 
 bool host_lib_init = false;
 bool device_connected = false;
@@ -54,6 +73,17 @@ String getTimeString() {
             now.day(), now.month(), now.year(),
             now.hour(), now.minute(), now.second());
     return String(buffer);
+}
+
+// Функція для запису на SD карту
+void writeToSD(String message) {
+    if (!sd_available) return;
+    
+    File logFile = SD.open("/usb_log.txt", FILE_APPEND);
+    if (logFile) {
+        logFile.println(message);
+        logFile.close();
+    }
 }
 
 // Transfer callback для читання даних - З БУФЕРИЗАЦІЄЮ
@@ -381,6 +411,70 @@ void setup() {
         rtc_working = false;
     }
     
+    // Тест SD карти
+    Serial.println("Тестуємо SD карту...");
+    Serial.println("Піни: SCK=12, MISO=13, MOSI=11, CS=10");
+    
+    // Перевіряємо підключення пінів
+    Serial.println("Перевіряємо піни...");
+    pinMode(SD_CS_PIN, OUTPUT);
+    digitalWrite(SD_CS_PIN, HIGH);
+    delay(10);
+    digitalWrite(SD_CS_PIN, LOW);
+    delay(10);
+    digitalWrite(SD_CS_PIN, HIGH);
+    Serial.println("CS пін працює");
+    
+    // Використовуємо нові піни (перепаяйте!)
+    // Нова схема: SCK=GPIO14, MISO=GPIO15, MOSI=GPIO16, CS=GPIO4
+    SPI.begin(14, 15, 16); // SCK=14, MISO=15, MOSI=16
+    delay(100);
+    
+    Serial.println("Спроба 1: 400kHz...");
+    if (SD.begin(SD_CS_PIN, SPI, 400000)) { // Дуже повільно
+        Serial.println("SD карта знайдена на 400kHz!");
+        sd_available = true;
+    } else {
+        Serial.println("Спроба 2: 100kHz...");
+        if (SD.begin(SD_CS_PIN, SPI, 100000)) { // Ще повільніше
+            Serial.println("SD карта знайдена на 100kHz!");
+            sd_available = true;
+        } else {
+            Serial.println("Спроба 3: без SPI об'єкту...");
+            if (SD.begin(SD_CS_PIN)) { // Стандартний SPI
+                Serial.println("SD карта знайдена зі стандартним SPI!");
+                sd_available = true;
+            } else {
+                Serial.println("SD карта НЕ знайдена!");
+                Serial.println("Перевірте:");
+                Serial.println("- Карта вставлена правильно?");
+                Serial.println("- Карта відформатована в FAT32?");
+                Serial.println("- Піни правильно припаяні?");
+                Serial.println("- Живлення 3.3V на карті?");
+                sd_available = false;
+            }
+        }
+    }
+    
+    if (sd_available) {
+        Serial.println("SD карта знайдена!");
+        sd_available = true;
+        
+        // Створюємо тестовий файл
+        File testFile = SD.open("/test_log.txt", FILE_WRITE);
+        if (testFile) {
+            testFile.println("=== ESP32-S3 USB Logger Started ===");
+            testFile.close();
+            Serial.println("Тестовий файл створено!");
+        } else {
+            Serial.println("Помилка створення файлу!");
+        }
+    } else {
+        Serial.println("SD карта НЕ знайдена!");
+        Serial.println("Продовжуємо без SD карти - тільки Serial вивід");
+        sd_available = false;
+    }
+    
     Serial.println("Ініціалізація USB Host...");
     
     // Налаштовуємо GPIO для USB-OTG (Host mode)
@@ -415,5 +509,51 @@ void setup() {
 }
 
 void loop() {
-    
+    // Обробка команд через Serial
+    if (Serial.available() > 0) {
+        String command = Serial.readString();
+        command.trim();
+        
+        if (command.startsWith("settime")) {
+            if (rtc_working) {
+                // Формат команди: settime YYYY-MM-DD HH:MM:SS
+                if (command.length() >= 27) { // "settime " + 19 символів дати/часу
+                    String dateTimeStr = command.substring(8); // Пропускаємо "settime "
+                    
+                    // Парсимо дату та час
+                    int year = dateTimeStr.substring(0, 4).toInt();
+                    int month = dateTimeStr.substring(5, 7).toInt();
+                    int day = dateTimeStr.substring(8, 10).toInt();
+                    int hour = dateTimeStr.substring(11, 13).toInt();
+                    int minute = dateTimeStr.substring(14, 16).toInt();
+                    int second = dateTimeStr.substring(17, 19).toInt();
+                    
+                    // Встановлюємо час
+                    DateTime newTime(year, month, day, hour, minute, second);
+                    rtc.adjust(newTime);
+                    
+                    Serial.printf("[RTC] Час встановлено: %04d-%02d-%02d %02d:%02d:%02d\n",
+                                  year, month, day, hour, minute, second);
+                } else {
+                    Serial.println("[RTC] Помилковий формат. Використовуйте: settime YYYY-MM-DD HH:MM:SS");
+                }
+            } else {
+                Serial.println("[RTC] RTC модуль недоступний");
+            }
+        } else if (command == "gettime") {
+            if (rtc_working) {
+                DateTime now = rtc.now();
+                Serial.printf("[RTC] Поточний час: %04d-%02d-%02d %02d:%02d:%02d\n",
+                              now.year(), now.month(), now.day(),
+                              now.hour(), now.minute(), now.second());
+            } else {
+                Serial.println("[RTC] RTC модуль недоступний");
+            }
+        } else if (command == "help") {
+            Serial.println("=== Команди RTC ===");
+            Serial.println("gettime                    - показати поточний час");
+            Serial.println("settime YYYY-MM-DD HH:MM:SS - встановити час");
+            Serial.println("help                       - показати цю довідку");
+        }
+    }
 }
