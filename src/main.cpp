@@ -42,6 +42,7 @@ bool rtc_working = false;
 // SD карта піни і стан
 #define SD_CS_PIN 4     // Новий CS пін
 bool sd_available = false;
+String currentLogFile = "";  // Ім'я поточного файлу логів
 
 bool host_lib_init = false;
 bool device_connected = false;
@@ -75,11 +76,26 @@ String getTimeString() {
     return String(buffer);
 }
 
+// Функція для створення нового файлу логів з назвою по поточній даті/часу
+String createLogFileName() {
+    if (!rtc_working) {
+        // Якщо RTC не працює, використовуємо загальну назву
+        return "/usb_log.txt";
+    }
+    
+    DateTime now = rtc.now();
+    char filename[50];
+    sprintf(filename, "/log_%04d%02d%02d_%02d%02d%02d.txt",
+            now.year(), now.month(), now.day(),
+            now.hour(), now.minute(), now.second());
+    return String(filename);
+}
+
 // Функція для запису на SD карту
 void writeToSD(String message) {
-    if (!sd_available) return;
+    if (!sd_available || currentLogFile.length() == 0) return;
     
-    File logFile = SD.open("/usb_log.txt", FILE_APPEND);
+    File logFile = SD.open(currentLogFile, FILE_APPEND);
     if (logFile) {
         logFile.println(message);
         logFile.close();
@@ -98,7 +114,9 @@ void usb_transfer_cb(usb_transfer_t *transfer) {
                 if (ch == '\n') {
                     // Знайдено кінець рядка - виводимо повний рядок з часом
                     String timeStr = getTimeString();
-                    Serial.println(timeStr + " " + lineBuffer);
+                    String fullMessage = timeStr + " " + lineBuffer;
+                    Serial.println(fullMessage);
+                    writeToSD(fullMessage); // Записуємо на SD
                     lineBuffer = ""; // Очищуємо буфер
                 } else if (ch == '\r') {
                     // Ігноруємо \r
@@ -109,7 +127,10 @@ void usb_transfer_cb(usb_transfer_t *transfer) {
                     
                     // Захист від переповнення буфера
                     if (lineBuffer.length() > LINE_BUFFER_SIZE - 10) {
-                        Serial.println(lineBuffer + " [ОБРІЗАНО]");
+                        String timeStr = getTimeString();
+                        String fullMessage = timeStr + " " + lineBuffer + " [ОБРІЗАНО]";
+                        Serial.println(fullMessage);
+                        writeToSD(fullMessage); // Записуємо на SD
                         lineBuffer = "";
                     }
                 }
@@ -163,7 +184,9 @@ void cdc_reader_task(void *arg) {
                             if (ch == '\n') {
                                 // Знайдено кінець рядка - виводимо повний рядок з часом
                                 String timeStr = getTimeString();
-                                Serial.println(timeStr + " " + lineBuffer);
+                                String fullMessage = timeStr + " " + lineBuffer;
+                                Serial.println(fullMessage);
+                                writeToSD(fullMessage); // Записуємо на SD
                                 lineBuffer = ""; // Очищуємо буфер
                             } else if (ch == '\r') {
                                 // Ігноруємо \r
@@ -174,7 +197,10 @@ void cdc_reader_task(void *arg) {
                                 
                                 // Захист від переповнення буфера
                                 if (lineBuffer.length() > LINE_BUFFER_SIZE - 10) {
-                                    Serial.println(lineBuffer + " [ОБРІЗАНО]");
+                                    String timeStr = getTimeString();
+                                    String fullMessage = timeStr + " " + lineBuffer + " [ОБРІЗАНО]";
+                                    Serial.println(fullMessage);
+                                    writeToSD(fullMessage); // Записуємо на SD
                                     lineBuffer = "";
                                 }
                             }
@@ -394,6 +420,10 @@ void setup() {
     Serial.println("    ESP32-S3 USB Host Logger - TRUE HOST");
     Serial.println("===============================================");
     
+    // Виводимо час запуску
+    String startTime = getTimeString();
+    Serial.println(startTime + " Система запущена");
+    
     // Тест RTC - простий
     Serial.println("Тестуємо RTC...");
     Wire.begin(8, 9); // SDA=GPIO8, SCL=GPIO9
@@ -460,14 +490,20 @@ void setup() {
         Serial.println("SD карта знайдена!");
         sd_available = true;
         
-        // Створюємо тестовий файл
-        File testFile = SD.open("/test_log.txt", FILE_WRITE);
-        if (testFile) {
-            testFile.println("=== ESP32-S3 USB Logger Started ===");
-            testFile.close();
-            Serial.println("Тестовий файл створено!");
+        // Створюємо файл логів з назвою по поточній даті/часу
+        currentLogFile = createLogFileName();
+        Serial.printf("Створюємо файл логів: %s\n", currentLogFile.c_str());
+        
+        File logFile = SD.open(currentLogFile, FILE_WRITE);
+        if (logFile) {
+            String startMessage = "=== ESP32-S3 USB Logger Started ===";
+            String timeStr = getTimeString();
+            logFile.println(timeStr + " " + startMessage);
+            logFile.close();
+            Serial.println("Файл логів створено!");
         } else {
-            Serial.println("Помилка створення файлу!");
+            Serial.println("Помилка створення файлу логів!");
+            currentLogFile = ""; // Скидаємо назву файлу при помилці
         }
     } else {
         Serial.println("SD карта НЕ знайдена!");
@@ -549,11 +585,36 @@ void loop() {
             } else {
                 Serial.println("[RTC] RTC модуль недоступний");
             }
+        } else if (command == "newlog") {
+            if (sd_available) {
+                // Створюємо новий файл логів
+                currentLogFile = createLogFileName();
+                Serial.printf("Створено новий файл логів: %s\n", currentLogFile.c_str());
+                
+                File logFile = SD.open(currentLogFile, FILE_WRITE);
+                if (logFile) {
+                    String timeStr = getTimeString();
+                    logFile.println(timeStr + " === Новий сеанс логування ===");
+                    logFile.close();
+                    Serial.println("Файл успішно створено!");
+                } else {
+                    Serial.println("Помилка створення нового файлу!");
+                    currentLogFile = "";
+                }
+            } else {
+                Serial.println("[SD] SD карта недоступна");
+            }
         } else if (command == "help") {
-            Serial.println("=== Команди RTC ===");
+            Serial.println("=== Команди системи ===");
             Serial.println("gettime                    - показати поточний час");
             Serial.println("settime YYYY-MM-DD HH:MM:SS - встановити час");
+            Serial.println("newlog                     - створити новий файл логів");
             Serial.println("help                       - показати цю довідку");
+            if (sd_available && currentLogFile.length() > 0) {
+                Serial.printf("Поточний файл логів: %s\n", currentLogFile.c_str());
+            } else {
+                Serial.println("SD карта недоступна - логування тільки в Serial");
+            }
         }
     }
 }
