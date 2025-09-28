@@ -56,23 +56,84 @@ usb_host_client_handle_t client_hdl;
 uint8_t usb_buffer[USB_BUFFER_SIZE];
 
 // Буфер для накопичення даних до кінця рядка
-#define LINE_BUFFER_SIZE 1024
+#define LINE_BUFFER_SIZE 16384  // 16KB для МАКСИМАЛЬНОЇ швидкості з 2 потоками!
 String lineBuffer = "";
+
+// АСИНХРОННИЙ SD БУФЕР для великих блоків
+#define SD_BUFFER_SIZE 8192   // 8KB буфер для SD
+String sdBuffer = "";
+bool sdBufferReady = false;   // Флаг готовності до запису
+uint32_t sdLinesInBuffer = 0; // Кількість рядків у SD буфері
 
 // Глобальна змінна для endpoint
 uint8_t cdc_in_endpoint = 0;
 
-// Функція для отримання часу з RTC
+// ШВИДКИЙ лічильник часу - БЕЗ звернень до RTC!
+struct FastTime {
+    uint16_t year;
+    uint8_t month;
+    uint8_t day;
+    uint8_t hour;
+    uint8_t minute;
+    uint8_t second;
+    uint32_t lastMillis;
+    uint32_t lastSyncMillis;  // Для синхронізації з RTC
+} fastTime;
+
+// ШВИДКЕ оновлення часу БЕЗ RTC
+void updateFastTime() {
+    uint32_t currentMillis = millis();
+    uint32_t elapsed = currentMillis - fastTime.lastMillis;
+    
+    // Оновлюємо тільки якщо пройшла хоча б секунда
+    if (elapsed >= 1000) {
+        uint32_t secondsToAdd = elapsed / 1000;
+        fastTime.second += secondsToAdd;
+        fastTime.lastMillis += (secondsToAdd * 1000); // Точний розрахунок
+        
+        // Швидка обробка переповнення
+        if (fastTime.second >= 60) {
+            fastTime.minute += fastTime.second / 60;
+            fastTime.second %= 60;
+            
+            if (fastTime.minute >= 60) {
+                fastTime.hour += fastTime.minute / 60;
+                fastTime.minute %= 60;
+                
+                if (fastTime.hour >= 24) {
+                    fastTime.day += fastTime.hour / 24;
+                    fastTime.hour %= 24;
+                }
+            }
+        }
+        
+        // РІДША синхронізація з RTC (раз на 5 хвилин)
+        if (rtc_working && (currentMillis - fastTime.lastSyncMillis > 300000)) {
+            DateTime now = rtc.now();
+            fastTime.year = now.year();
+            fastTime.month = now.month();
+            fastTime.day = now.day();
+            fastTime.hour = now.hour();
+            fastTime.minute = now.minute();
+            fastTime.second = now.second();
+            fastTime.lastSyncMillis = currentMillis;
+        }
+    }
+}
+
+// ШВИДКА функція для отримання часу - БЕЗ RTC звернень!
 String getTimeString() {
     if (!rtc_working) {
         return "[NO_RTC]";
     }
     
-    DateTime now = rtc.now();
+    // Оновлюємо час тільки якщо потрібно
+    updateFastTime();
+    
     char buffer[25];
     sprintf(buffer, "[%02d.%02d.%04d %02d:%02d:%02d]", 
-            now.day(), now.month(), now.year(),
-            now.hour(), now.minute(), now.second());
+            fastTime.day, fastTime.month, fastTime.year,
+            fastTime.hour, fastTime.minute, fastTime.second);
     return String(buffer);
 }
 
@@ -91,57 +152,254 @@ String createLogFileName() {
     return String(filename);
 }
 
-// Функція для запису на SD карту
+// ШВИДКА буферизована функція для SD запису
 void writeToSD(String message) {
     if (!sd_available || currentLogFile.length() == 0) return;
     
-    File logFile = SD.open(currentLogFile, FILE_APPEND);
-    if (logFile) {
-        logFile.println(message);
-        logFile.close();
+    // Додаємо до SD буфера ШВИДКО
+    sdBuffer += message + "\n";
+    sdLinesInBuffer++;
+    
+    // Позначаємо буфер готовим якщо він заповнений або пройшло багато часу
+    if (sdBuffer.length() >= SD_BUFFER_SIZE - 200 || sdLinesInBuffer >= 50) {
+        sdBufferReady = true;
     }
 }
 
-// Transfer callback для читання даних - З БУФЕРИЗАЦІЄЮ
+// Глобальні змінні для профілювання USB
+static uint32_t usbBytesReceived = 0;
+static uint32_t usbTransferCount = 0;
+static uint32_t lastUSBStatsTime = 0;
+
+// Transfer callback - ТІЛЬКИ ЧИТАННЯ І ЗАПИС У БУФЕР з ПРОФІЛЮВАННЯМ!
 void usb_transfer_cb(usb_transfer_t *transfer) {
-    // Перевіряємо чи це не transfer від активної задачі
     if (transfer->context != (void*)999) { 
         if (transfer->status == USB_TRANSFER_STATUS_COMPLETED && transfer->actual_num_bytes > 0) {
-            // Додаємо отримані дані до буфера рядка
-            for (int i = 0; i < transfer->actual_num_bytes; i++) {
-                char ch = (char)transfer->data_buffer[i];
-                
-                if (ch == '\n') {
-                    // Знайдено кінець рядка - виводимо повний рядок з часом
-                    String timeStr = getTimeString();
-                    String fullMessage = timeStr + " " + lineBuffer;
-                    Serial.println(fullMessage);
-                    writeToSD(fullMessage); // Записуємо на SD
-                    lineBuffer = ""; // Очищуємо буфер
-                } else if (ch == '\r') {
-                    // Ігноруємо \r
-                    continue;
-                } else {
-                    // Додаємо символ до буфера
-                    lineBuffer += ch;
-                    
-                    // Захист від переповнення буфера
-                    if (lineBuffer.length() > LINE_BUFFER_SIZE - 10) {
-                        String timeStr = getTimeString();
-                        String fullMessage = timeStr + " " + lineBuffer + " [ОБРІЗАНО]";
-                        Serial.println(fullMessage);
-                        writeToSD(fullMessage); // Записуємо на SD
-                        lineBuffer = "";
-                    }
+            
+            // Профілювання USB
+            usbBytesReceived += transfer->actual_num_bytes;
+            usbTransferCount++;
+            
+            // МАКСИМАЛЬНА ШВИДКІСТЬ - тільки додавання до буфера!
+            int bufLen = lineBuffer.length();
+            if (bufLen < LINE_BUFFER_SIZE - 100) {
+                // Додаємо дані швидко
+                for (int i = 0; i < transfer->actual_num_bytes; i++) {
+                    lineBuffer += (char)transfer->data_buffer[i];
                 }
+            }
+            
+            // Виводимо USB статистику кожні 10 секунд
+            uint32_t currentTime = millis();
+            if (lastUSBStatsTime == 0) lastUSBStatsTime = currentTime;
+            
+            if (currentTime - lastUSBStatsTime >= 10000) {
+                float bytesPerSec = (float)usbBytesReceived / ((currentTime - lastUSBStatsTime) / 1000.0f);
+                float transfersPerSec = (float)usbTransferCount / ((currentTime - lastUSBStatsTime) / 1000.0f);
+                
+                Serial.println("=== USB ПРОФІЛЮВАННЯ ===");
+                Serial.printf("[USB] Отримано: %d байт за %d мс\n", usbBytesReceived, (currentTime - lastUSBStatsTime));
+                Serial.printf("[USB] Швидкість: %.1f байт/сек (%.2f KB/s)\n", bytesPerSec, bytesPerSec / 1024.0f);
+                Serial.printf("[USB] Transfer'ів: %d (%.1f/сек)\n", usbTransferCount, transfersPerSec);
+                Serial.printf("[USB] Середній розмір пакету: %.1f байт\n", (float)usbBytesReceived / usbTransferCount);
+                
+                // Скидаємо лічильники
+                usbBytesReceived = 0;
+                usbTransferCount = 0;
+                lastUSBStatsTime = currentTime;
             }
         }
         
-        // Перезапускаємо transfer для безперервного читання
-        esp_err_t err = usb_host_transfer_submit(transfer);
-        if (err != ESP_OK) {
-            Serial.printf("[CDC] Помилка перезапуску: %s\n", esp_err_to_name(err));
+        // Миттєвий перезапуск
+        usb_host_transfer_submit(transfer);
+    }
+}
+
+// БЕЗПЕЧНИЙ ПОТІК для обробки буфера з ПРОФІЛЮВАННЯМ
+void buffer_processor_task(void *arg) {
+    Serial.println("[BUFFER] Потік обробки буфера запущено!");
+    
+    // Змінні для профілювання
+    uint32_t lastStatsTime = millis();
+    uint32_t totalProcessedLines = 0;
+    uint32_t cycleCount = 0;
+    uint32_t timeInIndexOf = 0;
+    uint32_t timeInSubstring = 0;
+    uint32_t timeInReplace = 0;
+    uint32_t timeInSerial = 0;
+    uint32_t timeInSD = 0;
+    
+    while (true) {
+        uint32_t cycleStart = micros();
+        
+        // Обробляємо буфер невеликими порціями щоб не викликати Watchdog
+        if (lineBuffer.length() > 0) {
+            int processedLines = 0;
+            
+            // Обробляємо тільки 10 рядків за раз для БЕЗПЕКИ
+            while (processedLines < 10 && lineBuffer.length() > 0) {
+                uint32_t t1 = micros();
+                int newlinePos = lineBuffer.indexOf('\n');
+                uint32_t t2 = micros();
+                timeInIndexOf += (t2 - t1);
+                
+                if (newlinePos == -1) break; // Немає повних рядків
+                
+                // Отримуємо повний рядок
+                t1 = micros();
+                String completeLine = lineBuffer.substring(0, newlinePos);
+                lineBuffer = lineBuffer.substring(newlinePos + 1);
+                t2 = micros();
+                timeInSubstring += (t2 - t1);
+                
+                // Швидка обробка та вивід
+                if (completeLine.length() > 0) {
+                    t1 = micros();
+                    completeLine.replace("\r", ""); // Прибираємо \r
+                    t2 = micros();
+                    timeInReplace += (t2 - t1);
+                    
+                    // ПРЯМИЙ вивід БЕЗ timestamp - МАКСИМАЛЬНА швидкість!
+                    t1 = micros();
+                    Serial.println(completeLine);
+                    t2 = micros();
+                    timeInSerial += (t2 - t1);
+                    
+                    // АСИНХРОННИЙ SD запис - НЕ блокує обробку!
+                    if (sd_available && currentLogFile.length() > 0) {
+                        t1 = micros();
+                        String timeStr = getTimeString(); // Швидкий час
+                        String fullMessage = timeStr + " " + completeLine;
+                        writeToSD(fullMessage); // Тепер це ШВИДКО - тільки додавання до буфера!
+                        t2 = micros();
+                        timeInSD += (t2 - t1);
+                    }
+                }
+                
+                processedLines++;
+                totalProcessedLines++;
+                
+                // Мікро-пауза після кожних 5 рядків для Watchdog
+                if (processedLines % 5 == 0) {
+                    vTaskDelay(pdMS_TO_TICKS(1)); // 1мс пауза для reset watchdog
+                }
+            }
+            
+            // Захист від переповнення
+            if (lineBuffer.length() > LINE_BUFFER_SIZE - 3000) {
+                Serial.println("[БУФЕР-ПЕРЕПОВНЕННЯ]");
+                lineBuffer = "";
+            }
         }
+        
+        cycleCount++;
+        uint32_t cycleEnd = micros();
+        uint32_t cycleTime = cycleEnd - cycleStart;
+        
+        // Виводимо статистику кожні 5 секунд
+        uint32_t currentTime = millis();
+        if (currentTime - lastStatsTime >= 5000) {
+            float frequency = (float)totalProcessedLines / ((currentTime - lastStatsTime) / 1000.0f);
+            float avgCycleTime = (float)cycleTime / cycleCount;
+            
+            Serial.println("=== ПРОФІЛЮВАННЯ БУФЕРА ===");
+            Serial.printf("[PERF] Оброблено рядків: %d за %d мс\n", totalProcessedLines, (currentTime - lastStatsTime));
+            Serial.printf("[PERF] Частота обробки: %.2f рядків/сек\n", frequency);
+            Serial.printf("[PERF] Розмір буфера: %d/%d байт (%.1f%%)\n", 
+                         lineBuffer.length(), LINE_BUFFER_SIZE, 
+                         (float)lineBuffer.length() / LINE_BUFFER_SIZE * 100.0f);
+            Serial.printf("[PERF] Циклів: %d, Сер. час циклу: %.1f мкс\n", cycleCount, avgCycleTime);
+            
+            // Розподіл часу по операціях (в мікросекундах)
+            Serial.println("[PERF] Час по операціях (мкс):");
+            Serial.printf("  indexOf: %d, substring: %d, replace: %d\n", timeInIndexOf, timeInSubstring, timeInReplace);
+            Serial.printf("  Serial: %d, SD: %d\n", timeInSerial, timeInSD);
+            
+            // Скидаємо лічильники
+            lastStatsTime = currentTime;
+            totalProcessedLines = 0;
+            cycleCount = 0;
+            timeInIndexOf = timeInSubstring = timeInReplace = timeInSerial = timeInSD = 0;
+        }
+        
+        // БІЛЬШИЙ delay для безпеки Watchdog
+        vTaskDelay(pdMS_TO_TICKS(10)); // 10мс delay для стабільності
+    }
+}
+
+// АСИНХРОННИЙ SD ПОТІК - запис великими блоками БЕЗ блокування системи
+void sd_writer_task(void *arg) {
+    Serial.println("[SD] Асинхронний SD потік запущено!");
+    
+    uint32_t lastForceWrite = millis();
+    uint32_t totalBytesWritten = 0;
+    uint32_t totalLinesWritten = 0;
+    uint32_t writeOperations = 0;
+    uint32_t lastStatsTime = millis();
+    
+    while (true) {
+        uint32_t currentTime = millis();
+        
+        // Перевіряємо чи потрібно записувати
+        bool shouldWrite = false;
+        
+        if (sdBufferReady) {
+            shouldWrite = true; // Буфер заповнений
+        } else if (sdBuffer.length() > 0 && (currentTime - lastForceWrite > 5000)) {
+            shouldWrite = true; // Примусовий запис кожні 5 секунд
+        }
+        
+        if (shouldWrite && sd_available && currentLogFile.length() > 0) {
+            uint32_t writeStart = micros();
+            
+            // Копіюємо дані для запису і очищуємо буфер ШВИДКО
+            String dataToWrite = sdBuffer;
+            uint32_t linesToWrite = sdLinesInBuffer;
+            sdBuffer = "";
+            sdBuffer.reserve(SD_BUFFER_SIZE); // Резервуємо пам'ять
+            sdLinesInBuffer = 0;
+            sdBufferReady = false;
+            
+            // Виконуємо ДОВГИЙ запис на SD (не блокує інші потоки!)
+            File logFile = SD.open(currentLogFile, FILE_APPEND);
+            if (logFile) {
+                logFile.print(dataToWrite); // Записуємо великий блок ОДРАЗУ
+                logFile.flush();
+                logFile.close();
+                
+                // Статистика
+                uint32_t writeTime = micros() - writeStart;
+                totalBytesWritten += dataToWrite.length();
+                totalLinesWritten += linesToWrite;
+                writeOperations++;
+                
+                Serial.printf("[SD] Записано %d байт (%d рядків) за %d мкс\n", 
+                             dataToWrite.length(), linesToWrite, writeTime);
+            }
+            
+            lastForceWrite = currentTime;
+        }
+        
+        // Виводимо SD статистику кожні 30 секунд
+        if (currentTime - lastStatsTime >= 30000) {
+            float avgBytesPerWrite = writeOperations > 0 ? (float)totalBytesWritten / writeOperations : 0;
+            float avgLinesPerWrite = writeOperations > 0 ? (float)totalLinesWritten / writeOperations : 0;
+            
+            Serial.println("=== SD СТАТИСТИКА ===");
+            Serial.printf("[SD] Записано: %d байт, %d рядків\n", totalBytesWritten, totalLinesWritten);
+            Serial.printf("[SD] Операцій запису: %d\n", writeOperations);
+            Serial.printf("[SD] Середній розмір блоку: %.1f байт (%.1f рядків)\n", 
+                         avgBytesPerWrite, avgLinesPerWrite);
+            Serial.printf("[SD] У буфері зараз: %d байт (%d рядків)\n", 
+                         sdBuffer.length(), sdLinesInBuffer);
+            
+            // Скидаємо статистику
+            totalBytesWritten = totalLinesWritten = writeOperations = 0;
+            lastStatsTime = currentTime;
+        }
+        
+        // SD потік працює рідше - не перешкоджає USB
+        vTaskDelay(pdMS_TO_TICKS(100)); // 100мс delay
     }
 }
 
@@ -177,6 +435,9 @@ void cdc_reader_task(void *arg) {
                     if (read_transfer->status == USB_TRANSFER_STATUS_COMPLETED && 
                         read_transfer->actual_num_bytes > 0) {
                         
+                        // ВІДКЛЮЧЕНО: обробка тут створює race condition з callback
+                        // Всі дані тепер обробляються тільки через usb_transfer_cb callback
+                        /*
                         // Обробляємо отримані дані з буферизацією
                         for (int i = 0; i < read_transfer->actual_num_bytes; i++) {
                             char ch = (char)read_transfer->data_buffer[i];
@@ -205,6 +466,7 @@ void cdc_reader_task(void *arg) {
                                 }
                             }
                         }
+                        */
                     }
                 } else {
                     Serial.printf("[READER] Transfer submit failed: %s\n", esp_err_to_name(err));
@@ -414,7 +676,6 @@ void usb_host_task(void *arg) {
 
 void setup() {
     Serial.begin(115200);
-    delay(2000);
     
     Serial.println("===============================================");
     Serial.println("    ESP32-S3 USB Host Logger - TRUE HOST");
@@ -433,12 +694,34 @@ void setup() {
         Serial.println("RTC знайдено!");
         rtc_working = true;
         DateTime now = rtc.now();
+        
+        // ІНІЦІАЛІЗУЄМО швидкий лічільник часу
+        fastTime.year = now.year();
+        fastTime.month = now.month();
+        fastTime.day = now.day();
+        fastTime.hour = now.hour();
+        fastTime.minute = now.minute();
+        fastTime.second = now.second();
+        fastTime.lastMillis = millis();
+        fastTime.lastSyncMillis = millis();
+        
         Serial.printf("Час з RTC: %04d-%02d-%02d %02d:%02d:%02d\n",
                       now.year(), now.month(), now.day(),
                       now.hour(), now.minute(), now.second());
+        Serial.println("ШВИДКИЙ лічільник часу ініціалізовано!");
     } else {
         Serial.println("RTC НЕ знайдено!");
         rtc_working = false;
+        
+        // Ініціалізуємо з базовими значеннями
+        fastTime.year = 2025;
+        fastTime.month = 9;
+        fastTime.day = 28;
+        fastTime.hour = 12;
+        fastTime.minute = 0;
+        fastTime.second = 0;
+        fastTime.lastMillis = millis();
+        fastTime.lastSyncMillis = millis();
     }
     
     // Тест SD карти
@@ -517,8 +800,16 @@ void setup() {
     gpio_set_direction(GPIO_NUM_19, GPIO_MODE_INPUT_OUTPUT);  // USB D-
     gpio_set_direction(GPIO_NUM_20, GPIO_MODE_INPUT_OUTPUT);  // USB D+
     
-    // Створюємо задачу USB Host
-    xTaskCreate(usb_host_task, "usb_host", 4096, NULL, 5, NULL);
+    // Створюємо задачу USB Host (тільки читання)
+    xTaskCreate(usb_host_task, "usb_host", 6144, NULL, 5, NULL);
+    
+    // Створюємо ОКРЕМИЙ потік для обробки буфера (БІЛЬШИЙ стек для безпеки)
+    xTaskCreate(buffer_processor_task, "buffer_proc", 8192, NULL, 4, NULL);
+    
+    // Створюємо АСИНХРОННИЙ SD потік (найнижчий пріоритет)
+    if (sd_available) {
+        xTaskCreate(sd_writer_task, "sd_writer", 4096, NULL, 2, NULL);
+    }
     
     // Чекаємо ініціалізації
     Serial.print("Чекаємо ініціалізації USB Host");
@@ -545,6 +836,8 @@ void setup() {
 }
 
 void loop() {
+    // Тепер loop() тільки для команд Serial - USB обробляється окремим потоком!
+    
     // Обробка команд через Serial
     if (Serial.available() > 0) {
         String command = Serial.readString();
@@ -564,9 +857,19 @@ void loop() {
                     int minute = dateTimeStr.substring(14, 16).toInt();
                     int second = dateTimeStr.substring(17, 19).toInt();
                     
-                    // Встановлюємо час
+                    // Встановлюємо час в RTC і швидкому лічільнику
                     DateTime newTime(year, month, day, hour, minute, second);
                     rtc.adjust(newTime);
+                    
+                    // Оновлюємо швидкий лічільник
+                    fastTime.year = year;
+                    fastTime.month = month;
+                    fastTime.day = day;
+                    fastTime.hour = hour;
+                    fastTime.minute = minute;
+                    fastTime.second = second;
+                    fastTime.lastMillis = millis();
+                    fastTime.lastSyncMillis = millis();
                     
                     Serial.printf("[RTC] Час встановлено: %04d-%02d-%02d %02d:%02d:%02d\n",
                                   year, month, day, hour, minute, second);
@@ -577,14 +880,8 @@ void loop() {
                 Serial.println("[RTC] RTC модуль недоступний");
             }
         } else if (command == "gettime") {
-            if (rtc_working) {
-                DateTime now = rtc.now();
-                Serial.printf("[RTC] Поточний час: %04d-%02d-%02d %02d:%02d:%02d\n",
-                              now.year(), now.month(), now.day(),
-                              now.hour(), now.minute(), now.second());
-            } else {
-                Serial.println("[RTC] RTC модуль недоступний");
-            }
+            String currentTime = getTimeString();
+            Serial.println("[TIME] " + currentTime);
         } else if (command == "newlog") {
             if (sd_available) {
                 // Створюємо новий файл логів
@@ -615,6 +912,14 @@ void loop() {
             } else {
                 Serial.println("SD карта недоступна - логування тільки в Serial");
             }
+        } else if (command == "status") {
+            Serial.printf("[STATUS] Буфер: %d/%d байт\n", lineBuffer.length(), LINE_BUFFER_SIZE);
+            Serial.printf("[STATUS] USB пристрій: %s\n", device_connected ? "підключено" : "відключено");
+            Serial.printf("[STATUS] SD карта: %s\n", sd_available ? "доступна" : "недоступна");
+            Serial.printf("[STATUS] RTC: %s\n", rtc_working ? "працює" : "недоступний");
         }
     }
+    
+    // Невелика затримка для loop()
+    delay(10);
 }
